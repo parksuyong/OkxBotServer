@@ -1,13 +1,19 @@
+# okx_trader.py
 import ccxt.async_support as ccxt
 import traceback
+import time
+import uuid
+import asyncio
 
 class OKXTrader:
     def __init__(self, exchange_instance):
         self.exchange = exchange_instance
-        print("OKX Trader Initialized.")
+        # 기본 모드 (필요 시 외부에서 설정 가능)
+        self.default_pos_side = "short"     # "short" / "long"
+        self.default_td_mode = "isolated"   # "isolated" / "cross"
 
     @classmethod
-    async def create(cls, api_key, api_secret, passphrase,ticker):
+    async def create(cls, api_key, api_secret, passphrase, ticker):
         """거래소 객체를 생성하고 시장 정보를 로드하는 비동기 팩토리 메소드"""
         exchange = ccxt.okx({
             'apiKey': api_key,
@@ -31,75 +37,67 @@ class OKXTrader:
             await exchange.close()
             return None
 
-    async def set_leverage(self, ticker, leverage):
+    # ---------- 공통 유틸 ----------
+    def _cid(self, prefix: str) -> str:
+        p = ''.join(ch for ch in str(prefix) if ch.isalnum()) or "ID"
+        raw = f"{p}{int(time.time()*1000)}{uuid.uuid4().hex[:6]}"
+        return raw[:32]
+
+    def _sanitize_clid(self, clid: str, fallback_prefix: str) -> str:
+        s = ''.join(ch for ch in str(clid) if ch.isalnum())
+        if not s:
+            return self._cid(fallback_prefix)
+        return s[:32]
+
+    def _to_px(self, ticker: str, price: float) -> float:
         try:
-            await self.exchange.set_leverage(
-                leverage=leverage,
-                symbol=ticker,
-                params={
-                    "mgnMode": "isolated",
-                    "posSide": "short"
-                }
-            )
-            print(f"[OKXTrader-{ticker}] Leverage set to {leverage}x successfully.")
-        except Exception as e:
-            print(f"Error setting leverage for {ticker}: {e}")
+            return float(self.exchange.price_to_precision(ticker, price))
+        except Exception:
+            return float(price)
 
-    async def close_entire_position(self, ticker):
-        """현재 포지션 전체를 시장가로 즉시 종료합니다."""
-        print(f"[OKXTrader-{ticker}] Attempting to close entire position...")
+    def _to_amt(self, ticker: str, amount: float) -> float:
         try:
-            # 1. 현재 포지션 정보를 가져옵니다.
-            position = await self.get_position(ticker)
-            if not position or float(position.get('contracts', 0)) == 0:
-                print("No position to close.")
-                return True
+            return float(self.exchange.amount_to_precision(ticker, amount))
+        except Exception:
+            return float(amount)
 
-            contracts_to_close = float(position.get('contracts'))
-
-            # 2. 포지션 청산을 위한 시장가 주문을 생성합니다. (숏 포지션이므로 매수 주문)
-            # reduceOnly: True 옵션은 포지션을 초과하여 주문이 체결되는 것을 방지하는 안전장치입니다.
-            params = {
-                'reduceOnly': True,
-                'posSide': 'short',
-                'tdMode': 'isolated'
-            }
-            await self.exchange.create_market_buy_order(ticker, contracts_to_close, params)
-            print(f"Market close order for {contracts_to_close} contracts placed successfully.")
-            return True
-
-        except Exception as e:
-            print(f"Error closing entire position for {ticker}: {e}")
-            return False
-
-    async def get_balance(self, currency='USDT'):
-        """지정한 통화의 잔고를 조회합니다."""
+    def _min_amount(self, ticker: str) -> float:
         try:
-            balance = await self.exchange.fetch_balance()
-            return balance.get(currency, {}).get('free', 0)
-        except Exception as e:
-            print(f"Error fetching balance: {e}")
-            return None
+            m = self.exchange.markets.get(ticker) or {}
+            return float((m.get("limits", {}).get("amount", {}) or {}).get("min") or 0)
+        except Exception:
+            return 0.0
+
+    async def _retry(self, coro_fn, *args, retries=1, backoff=0.4, **kwargs):
+        """가벼운 리트라이(필요 시 사용)."""
+        for i in range(retries + 1):
+            try:
+                return await coro_fn(*args, **kwargs)
+            except Exception as e:
+                if i >= retries:
+                    raise
+                await asyncio.sleep(backoff * (2 ** i))
+
+    # ---------- 조회/유틸 ----------
 
     def get_contract_size(self, ticker):
-        """지정한 티커의 계약 가치(1계약 당 코인 수)를 반환합니다."""
+        """1계약 당 코인 수"""
         market = self.exchange.markets.get(ticker)
         if market and 'contractSize' in market:
-            print(f"get_contract_size: {float(market['contractSize'])}")
             return float(market['contractSize'])
         return None
 
     async def get_current_price(self, ticker):
-        """지정한 티커의 현재 시장 가격을 가져옵니다."""
+        """현재가(float)"""
         try:
-            ticker_info = await self.exchange.fetch_ticker(ticker)
-            return ticker_info['last']
+            t = await self.exchange.fetch_ticker(ticker)
+            return float(t.get('last') or t.get('close'))
         except Exception as e:
             print(f"Error fetching current price for {ticker}: {e}")
             return None
 
     async def get_position(self, ticker):
-        """지정한 티커의 현재 포지션 정보를 가져옵니다."""
+        """현재 포지션(첫 번째 심볼 기준)"""
         try:
             positions = await self.exchange.fetch_positions([ticker])
             if positions:
@@ -110,72 +108,150 @@ class OKXTrader:
             return None
 
     async def fetch_open_orders(self, ticker):
-        """지정한 티커의 모든 대기 주문을 가져옵니다."""
         try:
-            orders = await self.exchange.fetch_open_orders(ticker)
-            return orders
+            return await self.exchange.fetch_open_orders(ticker)
         except Exception as e:
             print(f"Error fetching open orders for {ticker}: {e}")
             return []
 
-    async def create_market_short_order(self, ticker, contract_amount):
-        """지정한 코인 수량으로 시장가 숏 주문을 생성합니다."""
-        try:
-            params = {
-                'posSide': 'short',
-                'tdMode': 'isolated',
-
-            }
-
-            order = await self.exchange.create_market_sell_order(ticker, contract_amount, params)
-            print("Market short order created successfully.")
-            return order
-        except Exception as e:
-            print(f"Error creating market short order: {e}")
-            return None
-
-    async def create_limit_buy_tp_order(self, ticker, amount, price):
-        """'Reduce-Only' 옵션이 적용된 지정가 익절(TP) 주문을 생성합니다."""
-        try:
-            params = {
-                'reduceOnly': True,
-                'posSide': 'short',
-                'tdMode': 'isolated',
-
-            }
-            order = await self.exchange.create_limit_buy_order(ticker, amount, price, params)
-            print(f"Limit TP buy order for {ticker} at {price} created.")
-            return order
-        except Exception as e:
-            print(f"Error creating limit TP buy order: {e}")
-            return None
-
-    async def create_limit_short_dca_order(self, ticker, amount, price):
-        """익절(TP) 조건이 내장된 지정가 물타기(DCA) 숏 주문을 생성합니다."""
-        try:
-            params = {
-                'posSide': 'short',
-                'tdMode': 'isolated',
-
-            }
-            order = await self.exchange.create_limit_sell_order(ticker, amount, price, params)
-            print(f"Limit DCA short order for {ticker} at {price} created.")
-            return order
-        except Exception as e:
-            print(f"Error creating limit DCA short order: {e}")
-        return None
-
-
     async def cancel_order(self, order_id, ticker):
-        """지정한 ID의 주문을 취소합니다."""
         try:
             await self.exchange.cancel_order(order_id, ticker)
-            print(f"Order {order_id} has been cancelled.")
+            print(f"[CANCEL] id={order_id}")
             return True
         except Exception as e:
             print(f"Error cancelling order {order_id}: {e}")
             return False
 
+    async def cancel_order_by_client_id(self, ticker, client_id):
+        try:
+            await self.exchange.cancel_order(None, ticker, {'clOrdId': client_id})
+            print(f"[CANCEL by clOrdId] {client_id}")
+            return True
+        except Exception as e:
+            print(f"[cancel by clOrdId ERROR] {client_id}: {e}")
+            return False
+
+    def get_tick_size(self, ticker: str) -> float:
+        m = self.exchange.markets.get(ticker) or {}
+        # OKX는 info.tickSize에 있는 경우가 많음
+        return float(m.get("info", {}).get("tickSize")
+                     or (m.get("precision", {}).get("price") and 10 ** (-m["precision"]["price"]))
+                     or m.get("limits", {}).get("price", {}).get("min")
+                     or 0.01)
+
+    async def get_best_ask(self, ticker: str) -> float:
+        ob = await self.exchange.fetch_order_book(ticker, 5)
+        return float(ob["asks"][0][0]) if ob.get("asks") else await self.get_current_price(ticker)
+
+
+
+    # ---------- 주문(place_*) 단일 인터페이스 ----------
+
+    async def place_market_short(self, ticker: str, amount: float, *, clid_prefix="MKTSHORT", extra_params=None):
+        amt = self._to_amt(ticker, float(amount))
+        min_amt = self._min_amount(ticker)
+        if min_amt and amt < min_amt:
+            print(f"[SKIP MKTSHORT] amount {amt} < min {min_amt} for {ticker}")
+            return None
+
+        params = {
+            "tdMode": self.default_td_mode,
+            "posSide": "short",
+            "reduceOnly": False,
+        }
+        if extra_params:
+            params.update(extra_params)
+
+        # ★ 마지막에 clOrdId 확정(덮어쓰기 방지 + sanitize)
+        raw_clid = params.get("clOrdId") or self._cid(clid_prefix)
+        params["clOrdId"] = self._sanitize_clid(raw_clid, clid_prefix)
+
+        print(f"[MKTSHORT] {ticker} amt={amt} clOrdId={params['clOrdId']} params={params}")
+        return await self.exchange.create_order(ticker, "market", "sell", amt, None, params)
+
+
+    async def place_limit_short(self, ticker: str, amount: float, price: float, *, ioc=False, post_only=False, clid_prefix="LIMSHORT", extra_params=None):
+        amt = self._to_amt(ticker, float(amount))
+        min_amt = self._min_amount(ticker)
+        if min_amt and amt < min_amt:
+            print(f"[SKIP DCA] amount {amt} < min {min_amt} for {ticker}")
+            return None
+        px  = self._to_px(ticker, float(price))
+
+        params = {
+            "tdMode": self.default_td_mode,
+            "posSide": "short",
+            "reduceOnly": False,
+        }
+        if ioc:
+            params["timeInForce"] = "ioc"
+        if post_only:
+            params["postOnly"] = True
+        if extra_params:
+            params.update(extra_params)
+
+        # ★ 마지막에 clOrdId 확정(덮어쓰기 방지 + sanitize)
+        raw_clid = params.get("clOrdId") or self._cid(clid_prefix)
+        params["clOrdId"] = self._sanitize_clid(raw_clid, clid_prefix)
+
+        print(f"[DCA-LIMIT] {ticker} px={px} amt={amt} clOrdId={params['clOrdId']} params={params}")
+        return await self.exchange.create_order(ticker, "limit", "sell", amt, px, params)
+
+
+    async def place_reduceonly_tp_for_short(self, ticker: str, amount: float, tp_price: float, *, clid_prefix="TP", extra_params=None):
+        amt = self._to_amt(ticker, float(amount))
+        min_amt = self._min_amount(ticker)
+        if min_amt and amt < min_amt:
+            print(f"[SKIP TP] amount {amt} < min {min_amt} for {ticker}")
+            return None
+        px  = self._to_px(ticker, float(tp_price))
+
+        params = {
+            "tdMode": self.default_td_mode,
+            "posSide": "short",
+            "reduceOnly": True,
+        }
+        if extra_params:
+            params.update(extra_params)
+
+        # ★ 마지막에 clOrdId 확정(덮어쓰기 방지 + sanitize)
+        raw_clid = params.get("clOrdId") or self._cid(clid_prefix)
+        params["clOrdId"] = self._sanitize_clid(raw_clid, clid_prefix)
+
+        print(f"[TP-LIMIT] {ticker} px={px} amt={amt} clOrdId={params['clOrdId']} params={params}")
+        return await self.exchange.create_order(ticker, "limit", "buy", amt, px, params)
+
+
+    # ---------- 기타 ----------
+
+    async def set_leverage(self, ticker, leverage):
+        try:
+            await self.exchange.set_leverage(
+                leverage=leverage,
+                symbol=ticker,
+                params={"mgnMode": "isolated", "posSide": "short"}
+            )
+            print(f"[LEV] {ticker} -> {leverage}x")
+        except Exception as e:
+            print(f"Error setting leverage for {ticker}: {e}")
+
+    async def close_entire_position(self, ticker):
+        """포지션 전체 시장가 종료(reduceOnly)."""
+        print(f"[CLOSE ALL] {ticker}")
+        try:
+            position = await self.get_position(ticker)
+            if not position or float(position.get('contracts', 0)) == 0:
+                print("No position to close.")
+                return True
+            contracts_to_close = float(position.get('contracts'))
+            params = {'reduceOnly': True, 'posSide': 'short', 'tdMode': 'isolated'}
+            await self.exchange.create_market_buy_order(ticker, contracts_to_close, params)
+            print(f"[CLOSE OK] {contracts_to_close} contracts.")
+            return True
+        except Exception as e:
+            print(f"Error closing entire position for {ticker}: {e}")
+            return False
+
     async def close_connection(self):
-        """거래소와의 연결을 닫습니다."""
         await self.exchange.close()

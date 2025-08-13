@@ -1,220 +1,505 @@
-# event_handler.py (수정 제안)
-from okx_trader import OKXTrader
+# event_handler.py
 import asyncio
+import math
+import time
+from typing import Dict, Any, Optional
 
-# --- 상수 정의 ---
-TRADE_RATIO = 0.0015  # 익절 및 물타기 통합 비율 (0.2%)
-TOTAL_PROFIT_RATIO_THRESHOLD = 0.1 # 전체 익절 목표 수익률 (10%)
+TRADE_STEP  = 0.0015   # 0.5% 물타기 간격
+TP_STEP     = 0.0015  # 각 레그 익절 0.5%
+MAX_DCA     = 12      # 현재가 위로 물타기 개수
+BATCH_PAUSE = 0.15    # 벌크 주문 간 딜레이
+TICK_INTERVAL = 1.5   # 초 단위, 가격/포지션/주문 정합성 주기
+
+
+def ccxt_to_ws_symbol(ccxt_symbol: str) -> str:
+    """
+    'ETH/USDT:USDT' -> 'ETH-USDT-SWAP'
+    """
+    base, rest = ccxt_symbol.split('/')
+    quote = rest.split(':')[0]
+    return f"{base}-{quote}-SWAP"
+
+def ws_to_ccxt_symbol(ws_symbol: str) -> str:
+    """
+    'ETH-USDT-SWAP' -> 'ETH/USDT:USDT'
+    """
+    base, quote, _ = ws_symbol.split('-')
+    return f"{base}/{quote}:USDT"
 
 class EventHandler:
-    def __init__(self, trader: OKXTrader, ticker: str, leverage: int, amount: float):
+    def __init__(self, trader, ticker_ccxt: str, leverage: int, amount_usdt: float):
+        """
+        trader: OKXTrader
+        ticker_ccxt: ccxt 포맷 심볼 (예: 'ETH/USDT:USDT') ← 외부는 항상 이걸로 전달
+        leverage: 레버리지
+        amount_usdt: 레그당 USDT (계약수량은 현재가/contract_size로 환산)
+        """
+        # 심볼 표준화 (내부는 ccxt 포맷으로 통일)
+        self.symbol = ticker_ccxt                    # ccxt 포맷
+        self.symbol_ws = ccxt_to_ws_symbol(self.symbol)  # WS 포맷 (필요 시 바깥에서 사용)
+
         self.trader = trader
-        self.ticker = ticker
         self.leverage = leverage
-        self.amount = amount
-        self.open_orders = []
-        print(f"[EventHandler-{self.ticker}] Initialized with: leverage={self.leverage}, amount={self.amount}")
+        self.amount_usdt = float(amount_usdt)
 
+        # 내부 상태(서비스에선 DB 권장)
 
-    async def _sync_open_orders(self):
-        # (이전과 동일, 변경 없음)
-        print("Syncing open orders with exchange...")
+        self.last_filled_leg_price: Optional[float] = None
+        self.enter_on_start = True        # WS open 시 포지션 없으면 1레그 시장가 숏 진입
+        self.keep_dca_across_ticks = True # 매 틱마다 전체 취소 X, 차분 리배치
+        self.open_dca_orders: Dict[str, Dict[str, Any]] = {}  # id -> {price, amount}
+        self.open_tp_orders : Dict[str, Dict[str, Any]] = {}  # id -> {price, amount}
+
+        # 텔레메트리/스로틀
+        self.metrics = {
+            "oos_events": 0,        # out-of-order 등 이상 이벤트 수(필요시 증가)
+            "tp_trim_count": 0,     # TP 합계 > 포지션 → 트림 횟수
+            "reconcile_drift": 0,   # 로컬↔거래소 불일치 감지 횟수
+            "catchup_count": 0,     # 급등 캐치업 횟수
+        }
+        self._tp_created_for_leg = set()
+
+        self._last_catchup_ts = 0
+        self._last_metrics_ts = 0
+        self.CATCHUP_THROTTLE_SEC = 3
+        self.METRICS_EVERY_SEC    = 30
+        self._tick_task = None
+        self.grid_anchor_price: Optional[float] = None
+
+        # 캐치업 슬리피지 보호 옵션 (False=시장가, True=IOC 지정가)
+        self.use_ioc_for_catchup = False
+
+        print(f"[EH-{self.symbol}] Init (lev={self.leverage}, legUSDT={self.amount_usdt})  WS={self.symbol_ws}")
+
+    # 루프 함수
+    async def _tick_loop(self):
+        print(f"[TICK LOOP START] {self.symbol} every {TICK_INTERVAL}s")
         try:
-            fetched_orders = await self.trader.fetch_open_orders(self.ticker)
-            self.open_orders = []
-            for order in fetched_orders:
-                order_type = 'tp' if order['side'] == 'buy' else 'dca'
-                self.open_orders.append({
-                    'id': order['id'],
-                    'type': order_type,
-                    'price': order['price'],
-                    'amount': order['amount']
-                })
-            print(f"Sync complete. Found {len(self.open_orders)} open orders.")
-        except Exception as e:
-            print(f"Error during order sync: {e}")
-
-    async def _execute_initial_entry(self):
-        # (이전과 동일, num_contracts를 정수로 변환하는 부분만 수정)
-        print("Executing initial entry logic...")
-        contract_size = self.trader.get_contract_size(self.ticker)
-        if not contract_size:
-            print(f"Could not get contract size for {self.ticker}. Aborting entry.")
-            return
-
-        current_price = await self.trader.get_current_price(self.ticker)
-        if not current_price:
-            print("Failed to fetch price, cannot place order.")
-            return
-
-        target_coin_amount = self.amount / current_price
-        num_contracts = target_coin_amount / contract_size
-
-        print(f"Target: {self.amount} USDT -> {target_coin_amount:.4f} Coins -> {num_contracts} Contracts (size: {contract_size})")
-
-        if num_contracts < self.trader.exchange.markets[self.ticker]['limits']['amount']['min']:
-            print(f"Calculated contracts are less than minimum order size. Aborting.")
-            return
-
-        await self.trader.create_market_short_order(self.ticker, num_contracts)
-
-    async def handle_initial_state(self):
-        # (이전과 동일, 변경 없음)
-        print("Handling initial state...")
-        await self._sync_open_orders()
-        position = await self.trader.get_position(self.ticker)
-
-        if not position or float(position.get('contracts', 0)) == 0:
-            print("No active position found.")
-            if self.open_orders:
-                print(f"Found {len(self.open_orders)} dangling open orders. Cancelling all...")
-                await self._cancel_all_open_orders_manually()
-                self.open_orders.clear()
-
-                await asyncio.sleep(0.1)
+            while True:
+                await self.on_price_tick()
+                await asyncio.sleep(TICK_INTERVAL)
+        except asyncio.CancelledError:
+            print(f"[TICK LOOP STOP] {self.symbol}")
+            raise
 
 
-            await self._execute_initial_entry()
-        else:
-            print(f"Position for {self.ticker} already exists. Bot will monitor existing orders and events.")
-
+    # ---------- WS 훅(라우팅부가 호출할 수 있음) ----------
     async def on_open(self):
-        # (이전과 동일, 변경 없음)
-        print("WebSocket connection opened.")
-        await self.handle_initial_state()
+        """WS 연결 직후: (1) 초기 시장가 진입(옵션), (2) 틱 루프 시작"""
+        print(f"[WS OPEN] {self.symbol} (WS={self.symbol_ws})")
+        mkto = None
+        px = None
+        c = 0.0
+        # 1) 초기 시장가 진입 (enter_on_start=True 이고 포지션 0이면 1레그 진입)
+        try:
+            if getattr(self, "enter_on_start", True):
+                pos = await self.trader.get_position(self.symbol)
+                current_contracts = float(pos.get("contracts", 0) or 0) if pos else 0.0
+                if current_contracts <= 0:
+                    px = await self.trader.get_current_price(self.symbol)
+                    if px:
+                        c = await self._contracts_for_usdt(px)
+                        mkto = await self.trader.place_market_short(self.symbol, c)
+                        if mkto:
+                            # 베이스 가격 기록(이후 급등 캐치업/TP 계산에 사용)
+                            self.last_filled_leg_price = px
+                            print(f"[INIT ENTRY] market short 1-leg at ~{px} (contracts≈{c})")
+        except Exception as e:
+            print(f"[INIT ENTRY ERROR] {self.symbol}: {e}")
 
-    # 추가: 모든 DCA 주문을 취소하는 헬퍼 함수
-    async def _cancel_all_dca_orders(self):
-        """내부 주문 목록에 있는 모든 DCA 주문을 취소합니다."""
-        dca_orders_to_cancel = [o for o in self.open_orders if o['type'] == 'dca']
-        if not dca_orders_to_cancel:
+        if mkto:
+            self.last_filled_leg_price = px
+            self.grid_anchor_price = px          # ★ 그리드 기준을 첫 진입가로 고정
+            print(f"[INIT ENTRY] market short 1-leg at ~{px} (contracts≈{c})")
+
+        # 2) 틱 루프 시작 (이미 돌고 있지 않으면)
+        if getattr(self, "_tick_task", None) is None or self._tick_task.done():
+            try:
+                self._tick_task = asyncio.create_task(self._tick_loop())
+            except Exception as e:
+                print(f"[TICK LOOP START ERROR] {self.symbol}: {e}")
+
+
+
+
+    async def on_close(self, code=None, reason=None):
+        print(f"[WS CLOSE] {self.symbol} code={code} reason={reason}")
+        if self._tick_task and not self._tick_task.done():
+            self._tick_task.cancel()
+            try:
+                await self._tick_task
+            except asyncio.CancelledError:
+                pass
+            self._tick_task = None
+
+    async def on_error(self, err: Exception):
+        """WS 에러 훅(비동기)."""
+        print(f"[WS ERROR] {self.symbol}: {err}")
+
+    # ---------- CID 규칙(결정적) ----------
+    def _symkey(self) -> str:
+        return ''.join(c for c in self.symbol if c.isalnum())[:12]
+
+    def _cid_leg(self, px: float) -> str:
+        return f"LEG{self._symkey()}{int(px*1e4)}"[:32]
+
+    def _cid_tp_for_leg(self, leg_cid: str) -> str:
+        base = leg_cid.replace("LEG", "", 1)
+        return f"TP{base}"[:32]
+
+    def _cid_catchup(self, now_price: float) -> str:
+        return f"CATCHUP{self._symkey()}{int(now_price*1e2)}"[:32]
+
+    def _cid_tp_rebuild(self) -> str:
+        return f"TP{self._symkey()}REBUILD"[:32]
+
+
+    # ---------- 유틸 ----------
+    async def _contracts_for_usdt(self, ref_price: float) -> float:
+        cs = self.trader.get_contract_size(self.symbol)
+        if not cs or cs <= 0:
+            raise RuntimeError(f"Cannot get contract size for {self.symbol}")
+        coin_qty = self.amount_usdt / ref_price
+        return float(coin_qty / cs)
+
+    def _tp_for_short(self, entry_price: float) -> float:
+        return entry_price * (1.0 - TP_STEP)
+
+    def _count_missing_up_legs(self, last_leg_price: float, now_price: float) -> int:
+        if last_leg_price <= 0 or now_price <= 0:
+            return 0
+        ratio = (now_price / last_leg_price) - 1.0
+        return max(0, math.floor(ratio / TRADE_STEP))
+
+    async def on_order_update(self, msg: Dict[str, Any]):
+        """
+        OKX 주문채널 WS 업데이트 엔트리.
+        - 라우터가 원본 그대로 넘겨줘도 되고, 단일 주문 dict를 넘겨줘도 됨.
+        - filled/partially_filled면 on_leg_filled로 위임
+        - canceled 취소면 내부 오픈목록에서 제거
+        """
+        items = msg.get("data") if isinstance(msg, dict) and "data" in msg else None
+        if items is None:
+            items = [msg]  # 단일 dict도 처리
+
+        for o in items:
+            try:
+                state = (o.get("state") or o.get("ordStatus") or "").lower()
+                side  = (o.get("side") or "").lower()
+                oid   = o.get("ordId") or o.get("id")
+                cid   = o.get("clOrdId") or o.get("clientOrderId")
+
+                # 취소 이벤트면 내부 오픈목록에서 제거
+                if state in ("canceled", "cancelled"):
+                    if oid in self.open_dca_orders:
+                        self.open_dca_orders.pop(oid, None)
+                    if oid in self.open_tp_orders:
+                        self.open_tp_orders.pop(oid, None)
+                    continue
+
+                # 체결/부분체결 → on_leg_filled로 정규화 후 위임
+                if "fill" in state:  # "filled", "partially_filled" 등
+                    normalized = {
+                        "side": side,
+                        "avgPx": o.get("avgPx") or o.get("fillPx") or o.get("px"),
+                        "accFillSz": o.get("accFillSz") or o.get("fillSz") or o.get("sz"),
+                        "id": oid,
+                        "clOrdId": cid,
+                        "clientOrderId": cid,
+                    }
+                    await self.on_leg_filled(normalized)
+
+            except Exception as e:
+                print(f"[on_order_update ERROR] {self.symbol}: {e} item={o}")
+
+
+    # ---------- 외부 이벤트 훅 ----------
+    async def on_price_tick(self):
+        """주기(1~5초): 현재가 확정 → 급등 캐치업 → 물타기 재생성 → 정합성."""
+        now = await self.trader.get_current_price(self.symbol)
+        if not now:
+            return
+        await self._reconcile_jump_and_regenerate(now)
+        await self._reconcile_reduceonly_vs_position()
+        await self._reconcile_open_orders()
+
+        # 메트릭스 주기 출력
+        now_ts = time.time()
+        if now_ts - self._last_metrics_ts >= self.METRICS_EVERY_SEC:
+            print(f"[METRICS {self.symbol}] catchup={self.metrics['catchup_count']} "
+                  f"tpTrim={self.metrics['tp_trim_count']} drift={self.metrics['reconcile_drift']}")
+            self._last_metrics_ts = now_ts
+
+    async def on_leg_filled(self, order: Dict[str, Any]):
+        side = (order.get("side") or "").lower()
+        if side != "sell":
+            return
+        avg_px = float(order.get("avgPx", 0) or 0)
+        filled_contracts = float(order.get("accFillSz", 0) or 0)
+        if avg_px <= 0 or filled_contracts <= 0:
             return
 
-        print(f"Cancelling {len(dca_orders_to_cancel)} existing DCA orders...")
-        for order in dca_orders_to_cancel:
-            await self.trader.cancel_order(order['id'], self.ticker)
-            # 성공 여부와 관계없이 일단 목록에서 제거 (실패 시 다음 동기화에서 처리됨)
-            self.open_orders = [o for o in self.open_orders if o['id'] != order['id']]
+        # ★★★ 여기서 앵커 갱신 (체결된 순간에만 고정 그리드의 기준을 이동)
+        self.last_filled_leg_price = avg_px
+        self.grid_anchor_price = avg_px
+        # ★★★
 
-
-    async def _cancel_all_open_orders_manually(self):
-        """내부 목록에 있는 모든 미체결 주문을 하나씩 수동으로 취소합니다."""
-        # 목록의 복사본을 만들어 순회 (순회 중 원본 리스트가 변경되기 때문)
-        orders_to_cancel = list(self.open_orders)
-        if not orders_to_cancel:
+        leg_cid = (order.get("clientOrderId") or order.get("clOrdId")) or self._cid_leg(avg_px)
+        if leg_cid in self._tp_created_for_leg:
             return
 
-        print(f"Manually cancelling all {len(orders_to_cancel)} open orders...")
-        for order in orders_to_cancel:
-            await self.trader.cancel_order(order['id'], self.ticker)
-        print("Finished manual cancellation.")
+        tp_px = self._tp_for_short(avg_px)
+        tp_cid = self._cid_tp_for_leg(leg_cid)
+        try:
+            tp_order = await self.trader.place_reduceonly_tp_for_short(
+                ticker=self.symbol,
+                amount=filled_contracts,
+                tp_price=tp_px,
+                extra_params={"clOrdId": tp_cid}
+            )
+            if tp_order:
+                self.open_tp_orders[tp_order["id"]] = {"price": tp_px, "amount": filled_contracts}
+                self._tp_created_for_leg.add(leg_cid)
+                print(f"[TP created] {self.symbol} tp={tp_px} amt={filled_contracts} tpCID={tp_cid}")
+        except Exception as e:
+            print(f"[TP create ERROR] {self.symbol} entry={avg_px} tp={tp_px} err={e}")
 
 
-    # 변경: 새로운 거래 로직 적용
-    async def on_order_update(self, order):
-        """'orders' 채널에서 주문 업데이트 이벤트를 받았을 때 새로운 거래 로직을 처리합니다."""
-        order_id = order.get('ordId')
-        status = order.get('state')
+    async def _maker_safe_sell_price(self, target_price: float) -> float:
+        best_ask = await self.trader.get_best_ask(self.symbol)
+        tick = self._tick_size()
+        safe = max(float(target_price), float(best_ask) + (tick or 0))
+        return safe
 
-        # 체결되지 않은 주문은 무시
-        if status != 'filled':
-            # 만약 주문이 취소되었다면 우리 목록에서도 제거
-            if status in ['canceled', 'partially_filled_canceled']:
-                self.open_orders = [o for o in self.open_orders if o['id'] != order_id]
-            return
+    # event_handler.py - EventHandler 클래스 내부(아무 곳)
+    def _tick_size(self) -> float:
+        return self.trader.get_tick_size(self.symbol)
 
-        print(f"--- Order Filled: ID={order_id}, Side={order.get('side')} ---")
-        # 체결된 주문은 목록에서 즉시 제거
-        self.open_orders = [o for o in self.open_orders if o['id'] != order_id]
+    def _key_by_tick(self, px: float) -> int:
+        t = self._tick_size()
+        if not t:
+            return int(round(px*1e4))  # 안전장치
+        return int(round(float(px) / t))
 
-        side = order.get('side')
-        avg_price = float(order.get('avgPx', '0'))
-        filled_amount_contracts = float(order.get('accFillSz', '0'))
+    def _targets_from_anchor(self, anchor: float) -> list[float]:
+        """anchor 기준 위로 TRADE_STEP 간격으로 MAX_DCA 개의 목표가 생성"""
+        targets = []
+        p = float(anchor)
+        for _ in range(MAX_DCA):
+            p *= (1.0 + TRADE_STEP)
+            targets.append(p)
+        return targets
 
 
-        # --- 시나리오 1: 숏 주문 (최초 진입 또는 물타기) 체결 ---
-        if side == 'sell':
-            # 1. 기존의 모든 물타기 주문을 취소합니다.
-            await self._cancel_all_dca_orders()
+    async def on_position_update(self, position: Dict[str, Any]):
+        """
+        포지션 0이면 고아 주문 정리.
+        - WS 이벤트가 WS 포맷 심볼로 와도 상관 없음(여기서는 심볼 사용 X).
+        """
+        try:
+            pos_size = float(position.get('pos', 0) or 0)
+        except Exception:
+            pos_size = 0.0
 
-            # 2. 익절(TP) 주문 생성
-            tp_price = avg_price * (1 - TRADE_RATIO)
-            new_tp_order = await self.trader.create_limit_buy_tp_order(self.ticker, filled_amount_contracts, tp_price)
-            if new_tp_order:
-                self.open_orders.append({'id': new_tp_order['id'], 'type': 'tp', 'price': tp_price, 'amount': filled_amount_contracts})
+        if pos_size == 0:
+            await self._cancel_all_open_orders()
+            self.open_dca_orders.clear()
+            self.open_tp_orders.clear()
+            print(f"[Position=0] cleared all open orders for {self.symbol}")
 
-            # 3. 다음 물타기(DCA) 주문 생성
-            dca_price = avg_price * (1 + TRADE_RATIO)
-            new_dca_order = await self.trader.create_limit_short_dca_order(self.ticker, filled_amount_contracts, dca_price)
-            if new_dca_order:
-                self.open_orders.append({'id': new_dca_order['id'], 'type': 'dca', 'price': dca_price, 'amount': filled_amount_contracts})
 
-        # --- 시나리오 2: 롱 주문 (익절) 체결 ---
-        elif side == 'buy':
-            print("Take-profit order filled. Checking position status...")
-            await asyncio.sleep(0.1) # 포지션 정보가 업데이트될 시간을 줍니다.
-            position = await self.trader.get_position(self.ticker)
 
-            # 2-1. 포지션이 완전히 청산되었을 경우 -> 사이클 재시작
-            if not position or float(position.get('contracts', 0)) == 0:
-                print("Position fully closed. Restarting cycle.")
-                await self._cancel_all_open_orders_manually()
-                self.open_orders.clear()
-                await self._execute_initial_entry()
-            # 2-2. 포지션이 아직 남아있을 경우 (부분 익절) -> 다음 물타기 주문 생성
-            else:
-
-                # ▼▼▼ 여기가 새로운 '전체 익절' 로직의 시작입니다 ▼▼▼
-                if position:
+    # ---------- 핵심: 급등 캐치업 + 물타기 재배치 ----------
+    async def _reconcile_jump_and_regenerate(self, now_price: float):
+        """
+        (1) 급등 캐치업: last_filled_leg_price 기준 누락 레그를 시장가/IOC로 보정
+        (2) 물타기 차분 리배치: '앵커(grid_anchor_price)' 기준 고정 그리드 유지
+            - 부족한 자리만 추가, 목표 밖만 취소 (전체 리셋 없음)
+        """
+        # ---------- (1) 급등 캐치업 ----------
+        if self.last_filled_leg_price is not None and now_price > self.last_filled_leg_price:
+            missing = self._count_missing_up_legs(self.last_filled_leg_price, now_price)
+            if missing > 0:
+                now_ts = time.time()
+                if now_ts - self._last_catchup_ts >= self.CATCHUP_THROTTLE_SEC:
+                    MAX_CATCHUP_LEGS = 6
+                    missing = min(missing, MAX_CATCHUP_LEGS)
                     try:
-                        # ccxt의 표준 구조에 따라 미실현 손익과 초기 증거금을 가져옵니다.
-                        unrealized_pnl = float(position.get('unrealizedPnl', 0))
-                        realized_pnl = float(position['info'].get('realizedPnl', 0)) # 실현 손익
-                        initial_margin = float(position.get('initialMargin', 0))
+                        contracts_per_leg = await self._contracts_for_usdt(now_price)
+                        qty = contracts_per_leg * missing
+                        catchup_cid = self._cid_catchup(now_price)
+                        print(f"[CATCH-UP] now={now_price:.8f}, last={self.last_filled_leg_price:.8f}, missing={missing}, qty={qty}")
+                        if self.use_ioc_for_catchup:
+                            await self.trader.place_limit_short(
+                                ticker=self.symbol,
+                                amount=qty,
+                                price=now_price,
+                                ioc=True,
+                                post_only=False,
+                                extra_params={"clOrdId": catchup_cid}
+                            )
+                        else:
+                            await self.trader.place_market_short(
+                                ticker=self.symbol,
+                                amount=qty,
+                                extra_params={"clOrdId": catchup_cid}
+                            )
+                        self._last_catchup_ts = now_ts
+                        self.metrics["catchup_count"] += 1
+                    except Exception as e:
+                        print(f"[CATCH-UP ERROR] {self.symbol}: {e}")
 
-                        # 2. 두 손익을 더하여 총 손익을 계산합니다.
-                        total_pnl = unrealized_pnl + realized_pnl
+        # ---------- (2) 물타기 차분 리배치(앵커 기반) ----------
+        # 앵커가 없으면(초기) 임시로 now_price 사용 — 첫 체결 후 on_leg_filled에서 앵커가 갱신됨
+        anchor = self.grid_anchor_price or now_price
+        targets = self._targets_from_anchor(anchor)  # anchor 위로 TRADE_STEP 간격, MAX_DCA 개
 
-                        if initial_margin > 0:
-                            current_profit_ratio = total_pnl / initial_margin
-                            print(f"DEBUG: Profit Ratio Check: RealizedPnl={realized_pnl}, UnrealizedPnl={unrealized_pnl}, TotalPnl={total_pnl}, Margin={initial_margin}, Ratio={current_profit_ratio:.2%}")
+        # 거래소 최신 오픈오더 조회 후, LEG 주문만 틱키로 매핑
+        fetched = await self.trader.fetch_open_orders(self.symbol)
+        def key(px: float) -> int: return self._key_by_tick(px)
 
-                            if current_profit_ratio >= TOTAL_PROFIT_RATIO_THRESHOLD:
-                                print(f"Total profit target reached ({current_profit_ratio:.2%}). Closing entire position and restarting.")
+        ex_dca_by_key = {}
+        for o in fetched:
+            cid = (o.get("clientOrderId") or o.get("clOrdId") or "")
+            if cid.startswith("LEG"):
+                try:
+                    ex_dca_by_key[key(o.get("price"))] = o
+                except Exception:
+                    continue
 
-                                await self.trader.close_entire_position(self.ticker)
-                                await self._cancel_all_open_orders_manually()
-                                self.open_orders.clear()
-                                await self._execute_initial_entry()
-                                return
+        need_keys = { key(tp) for tp in targets }
 
-                    except (ValueError, TypeError, KeyError) as e:
-                        print(f"DEBUG: Could not calculate profit ratio due to an error: {e}")
+        # 2-1) 부족한 것만 생성
+        created = 0
+        for tp in targets:
+            k = key(tp)
+            if k in ex_dca_by_key:
+                continue  # 이미 존재 → 유지
+            try:
+                contracts_per_leg = await self._contracts_for_usdt(tp)
+                leg_cid = self._cid_leg(tp)
+                # 메이커가 보정: 최우선 매도호가 + 1틱 이상으로 올려서 postOnly 거절 회피
+                safe_px = await self._maker_safe_sell_price(tp)
+                order = await self.trader.place_limit_short(
+                    ticker=self.symbol,
+                    amount=contracts_per_leg,
+                    price=safe_px,
+                    ioc=False,
+                    post_only=True,
+                    extra_params={"clOrdId": leg_cid}
+                )
+                if order:
+                    created += 1
+                    await asyncio.sleep(BATCH_PAUSE)
+            except Exception as e:
+                print(f"[DCA create ERROR] {self.symbol} px={tp}: {e}")
 
-                # 변경: 부분 익절 시에도 모든 DCA 주문을 취소하고 새로 생성합니다.
-                print("Partial TP filled. Cancelling old DCA orders and placing a new one.")
-                await self._cancel_all_dca_orders()
+        # 2-2) 목표 밖(need_keys에 없는) LEG만 취소
+        for k_existing, o in list(ex_dca_by_key.items()):
+            if k_existing not in need_keys:
+                try:
+                    await self.trader.cancel_order(o["id"], self.symbol)
+                    await asyncio.sleep(BATCH_PAUSE)
+                except Exception as e:
+                    print(f"[DCA cancel EXTRA ERROR] {self.symbol} oid={o.get('id')}: {e}")
 
-                # 방금 익절된 가격 기준으로 다음 물타기 주문을 생성합니다.
-                dca_price = avg_price * (1 + TRADE_RATIO)
-                new_dca_order = await self.trader.create_limit_short_dca_order(self.ticker, filled_amount_contracts, dca_price)
-                if new_dca_order:
-                    self.open_orders.append({'id': new_dca_order['id'], 'type': 'dca', 'price': dca_price, 'amount': filled_amount_contracts})
+        print(f"[DCA reconciled] {self.symbol} created={created} keep={len(need_keys)} anchor={anchor}")
 
-        print(f" {self.ticker} Cycle complete. Current open orders: {len(self.open_orders)}")
 
-    # 변경: 로직 간소화
-    async def on_position_update(self, position):
-        """'positions' 채널에서 포지션 업데이트 이벤트를 받았을 때 (수동청산/강제청산 감지)"""
-        pos_size = float(position.get('pos', 0))
-        # 포지션이 0이 되었고, 우리 내부에 아직 미체결 주문이 남아있다면 수동/강제 청산으로 간주
-        if pos_size == 0 and self.open_orders:
-            print("Position manually/liquidated closed. Cancelling all related open orders.")
-            await self._cancel_all_open_orders_manually()
-            self.open_orders.clear() # 내부 목록도 비웁니다.
+    # ---------- 리컨실(정합성) ----------
+    async def _reconcile_reduceonly_vs_position(self):
+        """TP 합계 > 포지션 방지. 초과 시 TP 재배치(한 방)."""
+        pos = await self.trader.get_position(self.symbol)
+        if not pos:
+            return
+        current_contracts = float(pos.get("contracts", 0) or 0)
+        if current_contracts <= 0:
+            if self.open_tp_orders:
+                await self._cancel_open_tp_orders()
+                self.open_tp_orders.clear()
+            return
 
-    async def on_error(self, error):
-        print(f"An error occurred in WebSocket: {error}")
+        tp_total = sum(float(v["amount"]) for v in self.open_tp_orders.values())
+        if tp_total > current_contracts:
+            print(f"[TP TRIM] total {tp_total} > pos {current_contracts}. Rebuild.")
+            self.metrics["tp_trim_count"] += 1
+            await self._cancel_open_tp_orders()
+            self.open_tp_orders.clear()
 
-    async def on_close(self):
-        print("WebSocket connection closed.")
+            base_px = self.last_filled_leg_price or await self.trader.get_current_price(self.symbol)
+            tp_px = self._tp_for_short(base_px)
+            tp_cid = self._cid_tp_rebuild()
+            try:
+                order = await self.trader.place_reduceonly_tp_for_short(
+                    ticker=self.symbol,
+                    amount=current_contracts,
+                    tp_price=tp_px,
+                    extra_params={"clOrdId": tp_cid}
+                )
+                if order:
+                    self.open_tp_orders[order["id"]] = {"price": tp_px, "amount": current_contracts}
+            except Exception as e:
+                print(f"[TP rebuild ERROR] {self.symbol}: {e}")
+
+    async def _reconcile_open_orders(self):
+        """REST 미체결 ←→ 내부 목록 동기화 (clOrdId 우선 분류)."""
+        fetched = await self.trader.fetch_open_orders(self.symbol)
+        ex_ids = {o["id"] for o in fetched}
+
+        # 로컬 → 거래소에 없으면 제거
+        for oid in list(self.open_dca_orders.keys()):
+            if oid not in ex_ids:
+                self.open_dca_orders.pop(oid, None)
+        for oid in list(self.open_tp_orders.keys()):
+            if oid not in ex_ids:
+                self.open_tp_orders.pop(oid, None)
+
+        # 거래소 → 로컬에 없으면 흡수
+        local_ids = set(self.open_dca_orders.keys()) | set(self.open_tp_orders.keys())
+        before = len(local_ids)
+        for o in fetched:
+            if o["id"] in local_ids:
+                continue
+            cid = o.get("clientOrderId") or o.get("clOrdId") or ""
+            if cid.startswith("TP-"):
+                self.open_tp_orders[o["id"]] = {"price": o.get("price"), "amount": o.get("amount")}
+            elif cid.startswith("LEG-"):
+                self.open_dca_orders[o["id"]] = {"price": o.get("price"), "amount": o.get("amount")}
+            else:
+                # fallback: side로 추정
+                if (o.get("side") or "").lower() == "buy":
+                    self.open_tp_orders[o["id"]] = {"price": o.get("price"), "amount": o.get("amount")}
+                else:
+                    self.open_dca_orders[o["id"]] = {"price": o.get("price"), "amount": o.get("amount")}
+        after = len(set(self.open_dca_orders.keys()) | set(self.open_tp_orders.keys()))
+        if after != before:
+            self.metrics["reconcile_drift"] += 1
+
+    # ---------- 취소 유틸 ----------
+    async def _cancel_open_dca_orders(self):
+        if not self.open_dca_orders:
+            return
+        ids = list(self.open_dca_orders.keys())
+        for oid in ids:
+            try:
+                await self.trader.cancel_order(oid, self.symbol)
+            except Exception as e:
+                print(f"[cancel DCA ERROR] {self.symbol} oid={oid}: {e}")
+            await asyncio.sleep(BATCH_PAUSE)
+        self.open_dca_orders.clear()
+
+    async def _cancel_open_tp_orders(self):
+        if not self.open_tp_orders:
+            return
+        ids = list(self.open_tp_orders.keys())
+        for oid in ids:
+            try:
+                await self.trader.cancel_order(oid, self.symbol)
+            except Exception as e:
+                print(f"[cancel TP ERROR] {self.symbol} oid={oid}: {e}")
+            await asyncio.sleep(BATCH_PAUSE)
+        self.open_tp_orders.clear()
+
+    async def _cancel_all_open_orders(self):
+        await self._cancel_open_tp_orders()
+        await self._cancel_open_dca_orders()
