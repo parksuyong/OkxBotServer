@@ -66,6 +66,11 @@ class EventHandler:
         self._tick_task = None
         self.grid_anchor_price: Optional[float] = None
 
+
+        self.reenter_on_flat = True        # 포지션 0이면 자동 재진입
+        self.reenter_cooldown_sec = 5.0    # 재진입 쿨다운(초) - 과도한 재시도 방지
+        self._last_reenter_ts = 0.0        # 마지막 재진입 시각
+
         # 캐치업 슬리피지 보호 옵션 (False=시장가, True=IOC 지정가)
         self.use_ioc_for_catchup = False
 
@@ -87,30 +92,20 @@ class EventHandler:
     async def on_open(self):
         """WS 연결 직후: (1) 초기 시장가 진입(옵션), (2) 틱 루프 시작"""
         print(f"[WS OPEN] {self.symbol} (WS={self.symbol_ws})")
-        mkto = None
-        px = None
-        c = 0.0
+
+        # 초기화(정적분석 경고 방지용)
+        pos = None
+        current_contracts = 0.0
+
         # 1) 초기 시장가 진입 (enter_on_start=True 이고 포지션 0이면 1레그 진입)
         try:
             if getattr(self, "enter_on_start", True):
                 pos = await self.trader.get_position(self.symbol)
                 current_contracts = float(pos.get("contracts", 0) or 0) if pos else 0.0
                 if current_contracts <= 0:
-                    px = await self.trader.get_current_price(self.symbol)
-                    if px:
-                        c = await self._contracts_for_usdt(px)
-                        mkto = await self.trader.place_market_short(self.symbol, c)
-                        if mkto:
-                            # 베이스 가격 기록(이후 급등 캐치업/TP 계산에 사용)
-                            self.last_filled_leg_price = px
-                            print(f"[INIT ENTRY] market short 1-leg at ~{px} (contracts≈{c})")
+                    await self._enter_initial_position()  # 내부에서 last_filled_leg_price/grid_anchor_price 세팅
         except Exception as e:
             print(f"[INIT ENTRY ERROR] {self.symbol}: {e}")
-
-        if mkto:
-            self.last_filled_leg_price = px
-            self.grid_anchor_price = px          # ★ 그리드 기준을 첫 진입가로 고정
-            print(f"[INIT ENTRY] market short 1-leg at ~{px} (contracts≈{c})")
 
         # 2) 틱 루프 시작 (이미 돌고 있지 않으면)
         if getattr(self, "_tick_task", None) is None or self._tick_task.done():
@@ -118,6 +113,7 @@ class EventHandler:
                 self._tick_task = asyncio.create_task(self._tick_loop())
             except Exception as e:
                 print(f"[TICK LOOP START ERROR] {self.symbol}: {e}")
+
 
 
 
@@ -152,6 +148,8 @@ class EventHandler:
 
     def _cid_tp_rebuild(self) -> str:
         return f"TP{self._symkey()}REBUILD"[:32]
+
+
 
 
     # ---------- 유틸 ----------
@@ -211,6 +209,24 @@ class EventHandler:
 
             except Exception as e:
                 print(f"[on_order_update ERROR] {self.symbol}: {e} item={o}")
+
+    # EventHandler 클래스 내부 (재사용용 헬퍼)
+    async def _enter_initial_position(self):
+        """시장가 숏 1레그로 진입하고 앵커/베이스를 세팅"""
+        try:
+            px = await self.trader.get_current_price(self.symbol)
+            if not px:
+                return False
+            c = await self._contracts_for_usdt(px)
+            mkto = await self.trader.place_market_short(self.symbol, c)
+            if mkto:
+                self.last_filled_leg_price = px
+                self.grid_anchor_price = px
+                print(f"[INIT/RE-ENTRY] market short 1-leg at ~{px} (contracts≈{c})")
+                return True
+        except Exception as e:
+            print(f"[INIT/RE-ENTRY ERROR] {self.symbol}: {e}")
+        return False
 
 
     # ---------- 외부 이벤트 훅 ----------
@@ -292,20 +308,25 @@ class EventHandler:
 
 
     async def on_position_update(self, position: Dict[str, Any]):
-        """
-        포지션 0이면 고아 주문 정리.
-        - WS 이벤트가 WS 포맷 심볼로 와도 상관 없음(여기서는 심볼 사용 X).
-        """
         try:
             pos_size = float(position.get('pos', 0) or 0)
         except Exception:
             pos_size = 0.0
 
         if pos_size == 0:
+            # 우선 기존 주문 정리
             await self._cancel_all_open_orders()
             self.open_dca_orders.clear()
             self.open_tp_orders.clear()
             print(f"[Position=0] cleared all open orders for {self.symbol}")
+
+            # ★ 자동 재진입
+            if getattr(self, "reenter_on_flat", False):
+                now = time.time()
+                if now - getattr(self, "_last_reenter_ts", 0.0) >= getattr(self, "reenter_cooldown_sec", 5.0):
+                    ok = await self._enter_initial_position()
+                    if ok:
+                        self._last_reenter_ts = now
 
 
 
